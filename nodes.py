@@ -24,6 +24,9 @@ from comfy.utils import load_torch_file, save_torch_file
 import comfy.model_base
 import comfy.latent_formats
 
+import numpy as np
+from .hyvideo.modules.modulate_layers import modulate
+
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 def filter_state_dict_by_blocks(state_dict, blocks_mapping):
@@ -47,6 +50,29 @@ def standardize_lora_key_format(lora_sd):
             k = k.replace('transformer.', 'diffusion_model.')
         new_sd[k] = v
     return new_sd
+
+class HyVideoTeaCache:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "enable_teacache": ("BOOLEAN", {"default": False, "tooltip": "Enable TeaCache optimization"}),
+                "rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01,
+                                            "tooltip": "0.1 for 1.6x speedup, 0.15 for 2.1x speedup"}),
+            },
+        }
+    RETURN_TYPES = ("TEACACHEARGS",)
+    RETURN_NAMES = ("teacache_args",)
+    FUNCTION = "process"
+    CATEGORY = "HunyuanVideoWrapper"
+    DESCRIPTION = "TeaCache settings for HunyuanVideo to speed up inference"
+
+    def process(self, enable_teacache, rel_l1_thresh):
+        teacache_args = {
+            "enable_teacache": enable_teacache,
+            "rel_l1_thresh": rel_l1_thresh,
+        }
+        return (teacache_args,)
 
 class HyVideoLoraBlockEdit:
     def __init__(self):
@@ -153,6 +179,176 @@ class HyVideoEnhanceAVideo:
 
     def setargs(self, **kwargs):
         return (kwargs, )
+
+def teacache_forward(
+        self,
+        x,
+        t,
+        text_states=None,
+        text_mask=None,
+        text_states_2=None,
+        freqs_cos=None,
+        freqs_sin=None,
+        guidance=None,
+        return_dict=True,
+):
+    out = {}
+    img = x
+    txt = text_states
+    _, _, ot, oh, ow = x.shape
+    tt, th, tw = (
+        ot // self.patch_size[0],
+        oh // self.patch_size[1],
+        ow // self.patch_size[2],
+    )
+
+    # Prepare modulation vectors.
+    vec = self.time_in(t)
+
+    # text modulation
+    vec = vec + self.vector_in(text_states_2)
+
+    # guidance modulation
+    if self.guidance_embed:
+        if guidance is None:
+            raise ValueError(
+                "Didn't get guidance strength for guidance distilled model."
+            )
+
+        # our timestep_embedding is merged into guidance_in(TimestepEmbedder)
+        vec = vec + self.guidance_in(guidance)
+
+    # Embed image and text.
+    img = self.img_in(img)
+    if self.text_projection == "linear":
+        txt = self.txt_in(txt)
+    elif self.text_projection == "single_refiner":
+        txt = self.txt_in(txt, t, text_mask if self.use_attention_mask else None)
+    else:
+        raise NotImplementedError(
+            f"Unsupported text_projection: {self.text_projection}"
+        )
+
+    txt_seq_len = txt.shape[1]
+    img_seq_len = img.shape[1]
+
+    # Compute cu_squlens and max_seqlen for flash attention
+    cu_seqlens_q = get_cu_seqlens(text_mask, img_seq_len)
+    cu_seqlens_kv = cu_seqlens_q
+    max_seqlen_q = img_seq_len + txt_seq_len
+    max_seqlen_kv = max_seqlen_q
+
+    freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+
+    if self.enable_teacache:
+        inp = img.clone()
+        vec_ = vec.clone()
+        txt_ = txt.clone()
+        (
+            img_mod1_shift,
+            img_mod1_scale,
+            img_mod1_gate,
+            img_mod2_shift,
+            img_mod2_scale,
+            img_mod2_gate,
+        ) = self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
+        normed_inp = self.double_blocks[0].img_norm1(inp)
+        modulated_inp = modulate(
+            normed_inp, shift=img_mod1_shift, scale=img_mod1_scale
+        )
+        if self.cnt == 0 or self.cnt == self.num_steps-1:
+            should_calc = True
+            self.accumulated_rel_l1_distance = 0
+        else:
+            coefficients = [7.33226126e+02, -4.01131952e+02,  6.75869174e+01, -3.14987800e+00, 9.61237896e-02]
+            rescale_func = np.poly1d(coefficients)
+            self.accumulated_rel_l1_distance += rescale_func(((modulated_inp-self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()).cpu().item())
+            if self.accumulated_rel_l1_distance < self.rel_l1_thresh:
+                should_calc = False
+            else:
+                should_calc = True
+                self.accumulated_rel_l1_distance = 0
+        self.previous_modulated_input = modulated_inp
+        self.cnt += 1
+        if self.cnt == self.num_steps:
+            self.cnt = 0
+
+    if self.enable_teacache:
+        if not should_calc:
+            img += self.previous_residual
+        else:
+            ori_img = img.clone()
+            for _, block in enumerate(self.double_blocks):
+                double_block_args = [
+                    img,
+                    txt,
+                    vec,
+                    cu_seqlens_q,
+                    cu_seqlens_kv,
+                    max_seqlen_q,
+                    max_seqlen_kv,
+                    freqs_cis,
+                ]
+
+                img, txt = block(*double_block_args)
+
+            x = torch.cat((img, txt), 1)
+            if len(self.single_blocks) > 0:
+                for _, block in enumerate(self.single_blocks):
+                    single_block_args = [
+                        x,
+                        vec,
+                        txt_seq_len,
+                        cu_seqlens_q,
+                        cu_seqlens_kv,
+                        max_seqlen_q,
+                        max_seqlen_kv,
+                        (freqs_cos, freqs_sin),
+                    ]
+
+                    x = block(*single_block_args)
+
+            img = x[:, :img_seq_len, ...]
+            self.previous_residual = img - ori_img
+    else:
+        for _, block in enumerate(self.double_blocks):
+            double_block_args = [
+                img,
+                txt,
+                vec,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                max_seqlen_q,
+                max_seqlen_kv,
+                freqs_cis,
+            ]
+
+            img, txt = block(*double_block_args)
+
+        x = torch.cat((img, txt), 1)
+        if len(self.single_blocks) > 0:
+            for _, block in enumerate(self.single_blocks):
+                single_block_args = [
+                    x,
+                    vec,
+                    txt_seq_len,
+                    cu_seqlens_q,
+                    cu_seqlens_kv,
+                    max_seqlen_q,
+                    max_seqlen_kv,
+                    (freqs_cos, freqs_sin),
+                ]
+
+                x = block(*single_block_args)
+
+        img = x[:, :img_seq_len, ...]
+
+    img = self.final_layer(img, vec)
+    img = self.unpatchify(img, tt, th, tw)
+    if return_dict:
+        out["x"] = img
+        return out
+    return img
 
 class HyVideoSTG:
     @classmethod
@@ -277,6 +473,15 @@ class HyVideoModelLoader:
                 **factor_kwargs
             )
         transformer.eval()
+
+        transformer.__class__.original_forward = transformer.forward
+        transformer.__class__.enable_teacache = False
+        transformer.__class__.cnt = 0
+        transformer.__class__.num_steps = 0
+        transformer.__class__.rel_l1_thresh = 0.15
+        transformer.__class__.accumulated_rel_l1_distance = 0
+        transformer.__class__.previous_modulated_input = None
+        transformer.__class__.previous_residual = None
 
         comfy_model = HyVideoModel(
             HyVideoModelConfig(base_dtype),
@@ -1058,6 +1263,7 @@ class HyVideoSampler:
                 "stg_args": ("STGARGS", ),
                 "context_options": ("COGCONTEXT", ),
                 "feta_args": ("FETAARGS", ),
+                "teacache_args": ("TEACACHEARGS", ),
             }
         }
 
@@ -1067,13 +1273,31 @@ class HyVideoSampler:
     CATEGORY = "HunyuanVideoWrapper"
 
     def process(self, model, hyvid_embeds, flow_shift, steps, embedded_guidance_scale, seed, width, height, num_frames, 
-                samples=None, denoise_strength=1.0, force_offload=True, stg_args=None, context_options=None, feta_args=None):
+                samples=None, denoise_strength=1.0, force_offload=True, stg_args=None, context_options=None, feta_args=None, teacache_args=None):
         model = model.model
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         dtype = model["dtype"]
         transformer = model["pipe"].transformer
+
+        # Initialize TeaCache if enabled
+        if teacache_args is not None and teacache_args["enable_teacache"]:
+            transformer.__class__.enable_teacache = True
+            transformer.__class__.cnt = 0
+            transformer.__class__.num_steps = steps
+            transformer.__class__.rel_l1_thresh = teacache_args["rel_l1_thresh"]
+            transformer.__class__.accumulated_rel_l1_distance = 0
+            transformer.__class__.previous_modulated_input = None
+            transformer.__class__.previous_residual = None
+            # Properly bind the teacache_forward method
+            import types
+            transformer.forward = types.MethodType(teacache_forward, transformer)
+        else:
+            # Restore original forward method if it was modified
+            if hasattr(transformer.__class__, 'original_forward'):
+                transformer.forward = transformer.__class__.original_forward
+            transformer.__class__.enable_teacache = False
 
         #handle STG
         if stg_args is not None:
@@ -1408,6 +1632,7 @@ NODE_CLASS_MAPPINGS = {
     "HyVideoTextEmbedsLoad": HyVideoTextEmbedsLoad,
     "HyVideoContextOptions": HyVideoContextOptions,
     "HyVideoEnhanceAVideo": HyVideoEnhanceAVideo,
+    "HyVideoTeaCache": HyVideoTeaCache,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "HyVideoSampler": "HunyuanVideo Sampler",
@@ -1430,4 +1655,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HyVideoTextEmbedsLoad": "HunyuanVideo TextEmbeds Load",
     "HyVideoContextOptions": "HunyuanVideo Context Options",
     "HyVideoEnhanceAVideo": "HunyuanVideo Enhance A Video",
+    "HyVideoTeaCache": "HunyuanVideo TeaCache",
     }
