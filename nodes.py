@@ -26,6 +26,7 @@ import comfy.latent_formats
 
 import numpy as np
 from .hyvideo.modules.modulate_layers import modulate
+from .hyvideo.modules.attention import get_cu_seqlens
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -58,7 +59,7 @@ class HyVideoTeaCache:
             "required": {
                 "enable_teacache": ("BOOLEAN", {"default": False, "tooltip": "Enable TeaCache optimization"}),
                 "rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01,
-                                            "tooltip": "0.1 for 1.6x speedup, 0.15 for 2.1x speedup"}),
+                                            "tooltip": "Higher values will make TeaCache more aggressive, faster, but may cause artifacts"}),
             },
         }
     RETURN_TYPES = ("TEACACHEARGS",)
@@ -190,6 +191,8 @@ def teacache_forward(
         freqs_cos=None,
         freqs_sin=None,
         guidance=None,
+        stg_block_idx=-1,
+        stg_mode=None,
         return_dict=True,
 ):
     out = {}
