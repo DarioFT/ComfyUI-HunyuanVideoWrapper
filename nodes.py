@@ -259,9 +259,10 @@ def teacache_forward(
         modulated_inp = modulate(
             normed_inp, shift=img_mod1_shift, scale=img_mod1_scale
         )
-        if self.cnt == 0 or self.cnt == self.num_steps-1:
+        if self.cnt == 0 or self.cnt == self.num_steps-1 or self.previous_modulated_input is None or self.previous_modulated_input.shape != modulated_inp.shape:
             should_calc = True
             self.accumulated_rel_l1_distance = 0
+            self.previous_modulated_input = modulated_inp.clone()
         else:
             coefficients = [7.33226126e+02, -4.01131952e+02,  6.75869174e+01, -3.14987800e+00, 9.61237896e-02]
             rescale_func = np.poly1d(coefficients)
@@ -271,7 +272,7 @@ def teacache_forward(
             else:
                 should_calc = True
                 self.accumulated_rel_l1_distance = 0
-        self.previous_modulated_input = modulated_inp
+        self.previous_modulated_input = modulated_inp.clone()
         self.cnt += 1
         if self.cnt == self.num_steps:
             self.cnt = 0
@@ -485,6 +486,7 @@ class HyVideoModelLoader:
         transformer.__class__.accumulated_rel_l1_distance = 0
         transformer.__class__.previous_modulated_input = None
         transformer.__class__.previous_residual = None
+        transformer.last_dimensions = None
 
         comfy_model = HyVideoModel(
             HyVideoModelConfig(base_dtype),
@@ -1286,14 +1288,19 @@ class HyVideoSampler:
 
         # Initialize TeaCache if enabled
         if teacache_args is not None and teacache_args["enable_teacache"]:
+            # Check if dimensions have changed since last run
+            if (not hasattr(transformer, 'last_dimensions') or
+                    transformer.last_dimensions != (height, width, num_frames)):
+                # Reset TeaCache state on dimension change
+                transformer.__class__.cnt = 0
+                transformer.__class__.accumulated_rel_l1_distance = 0
+                transformer.__class__.previous_modulated_input = None
+                transformer.__class__.previous_residual = None
+                transformer.last_dimensions = (height, width, num_frames)
+
             transformer.__class__.enable_teacache = True
-            transformer.__class__.cnt = 0
             transformer.__class__.num_steps = steps
             transformer.__class__.rel_l1_thresh = teacache_args["rel_l1_thresh"]
-            transformer.__class__.accumulated_rel_l1_distance = 0
-            transformer.__class__.previous_modulated_input = None
-            transformer.__class__.previous_residual = None
-            # Properly bind the teacache_forward method
             import types
             transformer.forward = types.MethodType(teacache_forward, transformer)
         else:
