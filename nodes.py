@@ -199,6 +199,11 @@ def teacache_forward(
     batch_size, channels, num_frames, height, width = x.shape
     current_dims = (num_frames, height, width)
 
+    # Update FETA frame count if needed
+    from .enhance_a_video.globals import set_num_frames, get_num_frames
+    if get_num_frames() is None:
+        set_num_frames(num_frames)
+
     # Check if dimensions changed since last run
     if not hasattr(self, 'last_dims') or self.last_dims != current_dims:
         # Reset TeaCache state on dimension change
@@ -1286,6 +1291,14 @@ class HyVideoSampler:
 
     def process(self, model, hyvid_embeds, flow_shift, steps, embedded_guidance_scale, seed, width, height, num_frames, 
                 samples=None, denoise_strength=1.0, force_offload=True, stg_args=None, context_options=None, feta_args=None, teacache_args=None):
+
+        # Handle FETA setup
+        if feta_args is not None:
+            from .enhance_a_video.globals import set_num_frames, set_enhance_weight, enable_enhance
+            set_num_frames(num_frames)
+            set_enhance_weight(feta_args["weight"])
+            enable_enhance(feta_args["single_blocks"], feta_args["double_blocks"])
+
         model = model.model
 
         device = mm.get_torch_device()
