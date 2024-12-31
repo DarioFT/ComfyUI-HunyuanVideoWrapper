@@ -195,6 +195,19 @@ def teacache_forward(
         stg_mode=None,
         return_dict=True,
 ):
+    # Get current dimensions
+    batch_size, channels, num_frames, height, width = x.shape
+    current_dims = (num_frames, height, width)
+
+    # Check if dimensions changed since last run
+    if not hasattr(self, 'last_dims') or self.last_dims != current_dims:
+        # Reset TeaCache state on dimension change
+        self.cnt = 0
+        self.accumulated_rel_l1_distance = 0
+        self.previous_modulated_input = None
+        self.previous_residual = None
+        self.last_dims = current_dims
+
     out = {}
     img = x
     txt = text_states
@@ -205,37 +218,28 @@ def teacache_forward(
         ow // self.patch_size[2],
     )
 
-    # Prepare modulation vectors.
+    # Prepare modulation vectors
     vec = self.time_in(t)
-
-    # text modulation
     vec = vec + self.vector_in(text_states_2)
 
-    # guidance modulation
     if self.guidance_embed:
         if guidance is None:
-            raise ValueError(
-                "Didn't get guidance strength for guidance distilled model."
-            )
-
-        # our timestep_embedding is merged into guidance_in(TimestepEmbedder)
+            raise ValueError("Didn't get guidance strength for guidance distilled model.")
         vec = vec + self.guidance_in(guidance)
 
-    # Embed image and text.
+    # Embed image and text
     img = self.img_in(img)
     if self.text_projection == "linear":
         txt = self.txt_in(txt)
     elif self.text_projection == "single_refiner":
         txt = self.txt_in(txt, t, text_mask if self.use_attention_mask else None)
     else:
-        raise NotImplementedError(
-            f"Unsupported text_projection: {self.text_projection}"
-        )
+        raise NotImplementedError(f"Unsupported text_projection: {self.text_projection}")
 
     txt_seq_len = txt.shape[1]
     img_seq_len = img.shape[1]
 
-    # Compute cu_squlens and max_seqlen for flash attention
+    # Compute attention parameters
     cu_seqlens_q = get_cu_seqlens(text_mask, img_seq_len)
     cu_seqlens_kv = cu_seqlens_q
     max_seqlen_q = img_seq_len + txt_seq_len
@@ -259,12 +263,13 @@ def teacache_forward(
         modulated_inp = modulate(
             normed_inp, shift=img_mod1_shift, scale=img_mod1_scale
         )
-        if self.cnt == 0 or self.cnt == self.num_steps-1 or self.previous_modulated_input is None or self.previous_modulated_input.shape != modulated_inp.shape:
+
+        if self.cnt == 0 or self.cnt == self.num_steps-1:
             should_calc = True
             self.accumulated_rel_l1_distance = 0
             self.previous_modulated_input = modulated_inp.clone()
         else:
-            coefficients = [7.33226126e+02, -4.01131952e+02,  6.75869174e+01, -3.14987800e+00, 9.61237896e-02]
+            coefficients = [7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02]
             rescale_func = np.poly1d(coefficients)
             self.accumulated_rel_l1_distance += rescale_func(((modulated_inp-self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()).cpu().item())
             if self.accumulated_rel_l1_distance < self.rel_l1_thresh:
@@ -277,10 +282,14 @@ def teacache_forward(
         if self.cnt == self.num_steps:
             self.cnt = 0
 
-    if self.enable_teacache:
-        if not should_calc:
-            img += self.previous_residual
-        else:
+        if not should_calc and self.previous_residual is not None:
+            # Verify tensor dimensions match before adding
+            if img.shape == self.previous_residual.shape:
+                img = img + self.previous_residual
+            else:
+                should_calc = True # Force recalculation if dimensions don't match
+
+        if should_calc:
             ori_img = img.clone()
             for _, block in enumerate(self.double_blocks):
                 double_block_args = [
@@ -293,7 +302,6 @@ def teacache_forward(
                     max_seqlen_kv,
                     freqs_cis,
                 ]
-
                 img, txt = block(*double_block_args)
 
             x = torch.cat((img, txt), 1)
@@ -309,12 +317,12 @@ def teacache_forward(
                         max_seqlen_kv,
                         (freqs_cos, freqs_sin),
                     ]
-
                     x = block(*single_block_args)
 
             img = x[:, :img_seq_len, ...]
             self.previous_residual = img - ori_img
     else:
+        # Regular forward pass without TeaCache
         for _, block in enumerate(self.double_blocks):
             double_block_args = [
                 img,
@@ -326,7 +334,6 @@ def teacache_forward(
                 max_seqlen_kv,
                 freqs_cis,
             ]
-
             img, txt = block(*double_block_args)
 
         x = torch.cat((img, txt), 1)
@@ -342,7 +349,6 @@ def teacache_forward(
                     max_seqlen_kv,
                     (freqs_cos, freqs_sin),
                 ]
-
                 x = block(*single_block_args)
 
         img = x[:, :img_seq_len, ...]
@@ -487,6 +493,7 @@ class HyVideoModelLoader:
         transformer.__class__.previous_modulated_input = None
         transformer.__class__.previous_residual = None
         transformer.last_dimensions = None
+        transformer.last_frame_count = None
 
         comfy_model = HyVideoModel(
             HyVideoModelConfig(base_dtype),
@@ -1290,13 +1297,16 @@ class HyVideoSampler:
         if teacache_args is not None and teacache_args["enable_teacache"]:
             # Check if dimensions have changed since last run
             if (not hasattr(transformer, 'last_dimensions') or
-                    transformer.last_dimensions != (height, width, num_frames)):
+                    transformer.last_dimensions != (height, width, num_frames) or
+                    not hasattr(transformer, 'last_frame_count') or
+                    transformer.last_frame_count != num_frames):
                 # Reset TeaCache state on dimension change
                 transformer.__class__.cnt = 0
                 transformer.__class__.accumulated_rel_l1_distance = 0
                 transformer.__class__.previous_modulated_input = None
                 transformer.__class__.previous_residual = None
                 transformer.last_dimensions = (height, width, num_frames)
+                transformer.last_frame_count = num_frames
 
             transformer.__class__.enable_teacache = True
             transformer.__class__.num_steps = steps
